@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: noctra-audio
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: NOCTRA_ORIGIN
+        value: https://noctra-listen.asoren7jan2031.chatgpt.site
+      - key: AUDIO_API_KEY
+        sync: false
+      - key: AUDIO_SIGNING_KEY
+        generateValue: true
