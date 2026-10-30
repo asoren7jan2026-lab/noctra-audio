@@ -14,6 +14,7 @@ test('classifies actual upstream failures without exposing upstream URLs',()=>{
   [{code:'ENOENT'},'EXTRACTOR_NOT_INSTALLED',503,false],
   [{killed:true},'EXTRACTION_TIMEOUT',504,true],
   [{stderr:"ERROR: Sign in to confirm you're not a bot"},'PROVIDER_VERIFICATION_REQUIRED',403,false],
+  [{stderr:'WARNING: HTTP Error 429: Too Many Requests\nERROR: [youtube] n0GXk_T2zs8: Sign in to confirm you’re not a bot. Use cookies for authentication.'},'PROVIDER_VERIFICATION_REQUIRED',403,false],
   [{stderr:'ERROR: HTTP Error 429: Too Many Requests'},'UPSTREAM_RATE_LIMIT',429,true],
   [{stderr:'ERROR: The uploader has not made this video available in your country'},'REGION_RESTRICTED',451,false],
   [{stderr:'ERROR: Requested format is not available'},'AUDIO_FORMAT_UNAVAILABLE',422,false],
@@ -22,6 +23,22 @@ test('classifies actual upstream failures without exposing upstream URLs',()=>{
  for(const [raw,code,status,retryable] of cases){const result=extractionError(raw);assert.equal(result.code,code);assert.equal(result.status,status);assert.equal(result.retryable,retryable);}
  const line=diagnosticLine('WARNING: earlier\nERROR: source https://rr1.googlevideo.com/playback?sig=secret token=private');
  assert.ok(!line.includes('sig=secret'));assert.ok(!line.includes('token=private'));assert.ok(!line.includes('https://'));
+});
+
+test('provider cooldown spans recordings, forced refresh and search without more subprocesses',async()=>{
+ let clock=Date.now(),calls=0;
+ const extractor=new Extractor({now:()=>clock,run:async()=>{calls++;if(calls===2)throw Object.assign(new Error('limited'),{stderr:'ERROR: HTTP Error 429: Too Many Requests'});return{stdout:JSON.stringify(info)};}});
+ await extractor.resolve(id);
+ clock+=180000;
+ await extractor.resolve(id);assert.equal(calls,1,'valid URLs survive longer than the old two-minute cache');
+ await assert.rejects(()=>extractor.resolve('AbCdEfGhI_2'),e=>e.code==='UPSTREAM_RATE_LIMIT'&&e.retryAt===clock+600000);
+ await assert.rejects(()=>extractor.resolve('AbCdEfGhI_3'),e=>e.code==='UPSTREAM_RATE_LIMIT');
+ await assert.rejects(()=>extractor.resolve(id,{force:true}),e=>e.code==='UPSTREAM_RATE_LIMIT');
+ await assert.rejects(()=>extractor.search('song'),e=>e.code==='UPSTREAM_RATE_LIMIT');
+ assert.equal((await extractor.resolve(id)).id,id,'valid cached audio remains available');
+ assert.equal(calls,2);assert.equal(extractor.availability().retryAfterSeconds,600);
+ clock+=600001;assert.equal(extractor.availability().available,true);
+ await extractor.resolve(id);assert.equal(calls,3);
 });
 
 test('one free-tier process is allowed; a failed extraction does not poison later requests',async()=>{
@@ -50,6 +67,16 @@ async function serve(options,fn){
  try{await fn('http://127.0.0.1:'+server.address().port);}
  finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
 }
+test('verification errors expose a cooldown and process health does not claim provider readiness',async()=>{
+ let calls=0;
+ const extractor=new Extractor({run:async()=>{calls++;throw Object.assign(new Error('verification'),{stderr:'WARNING: HTTP Error 429\nERROR: Sign in to confirm you’re not a bot.'});}});
+ await serve({extractor},async root=>{
+  const resolve=videoId=>fetch(root+'/internal/resolve',{method:'POST',headers:{Authorization:'Bearer '+apiKey},body:JSON.stringify({videoId,force:true})});
+  let r=await resolve(id),failure=await r.json();assert.equal(r.status,403);assert.equal(failure.code,'PROVIDER_VERIFICATION_REQUIRED');assert.equal(failure.retryable,false);assert.ok(Number(r.headers.get('retry-after'))>=599);
+  r=await resolve('AbCdEfGhI_2');assert.equal(r.status,403);assert.equal(calls,1);
+  const health=await(await fetch(root+'/health')).json();assert.equal(health.ok,true);assert.equal(health.provider.available,false);assert.equal(health.provider.code,'PROVIDER_VERIFICATION_REQUIRED');assert.ok(!JSON.stringify(health).includes(apiKey));
+ });
+});
 test('public diagnostic verifies bounded CDN ranges, complete audio and seeking once',async()=>{
  const size=786509,ranges=[];let resolves=0,done;const completion=new Promise(resolve=>{done=resolve});
  await serve({

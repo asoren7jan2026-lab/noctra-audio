@@ -16,8 +16,10 @@ export function extractionError(error, timeoutMs=90000) {
   if(error.code==='ENOENT')return new AudioError('EXTRACTOR_NOT_INSTALLED','The audio extractor is missing on the server.',503);
   if(error.killed||error.code==='ETIMEDOUT')return new AudioError('EXTRACTION_TIMEOUT','Audio extraction exceeded '+Math.round(timeoutMs/1000)+' seconds. Retry shortly.',504,true);
   if(error.code==='MAXBUFFER')return new AudioError('EXTRACTOR_OUTPUT_LIMIT','The extractor returned too much metadata for this server.',502);
-  if(/HTTP Error 429|Too Many Requests|rate.?limit/i.test(text))return new AudioError('UPSTREAM_RATE_LIMIT','YouTube is rate-limiting this server. Try again later.',429,true);
-  if(/Sign in to confirm|confirm you.re not a bot|LOGIN_REQUIRED|authentication required/i.test(text))return new AudioError('PROVIDER_VERIFICATION_REQUIRED','YouTube requires sign-in or verification for this server request. No playable audio was returned.',403);
+  // Prefer the final failure over earlier retry warnings in the same stderr.
+  const final=text.replace(/\x1b\[[0-9;]*m/g,'').split(/\r?\n/).findLast(line=>/^ERROR:/i.test(line))||text;
+  if(/Sign in to confirm|confirm you.re not a bot|LOGIN_REQUIRED|authentication required/i.test(final))return new AudioError('PROVIDER_VERIFICATION_REQUIRED','YouTube requires verification for this server. Choose JioSaavn or another audio source in Settings.',403);
+  if(/HTTP Error 429|Too Many Requests|rate.?limit/i.test(final))return new AudioError('UPSTREAM_RATE_LIMIT','YouTube is limiting this server. New requests are paused; choose another audio source or try later.',429,true);
   if(/not available in your country|not made.*available in your country|geo.?restricted/i.test(text))return new AudioError('REGION_RESTRICTED','This recording is unavailable in the server region.',451);
   if(/private video|has been removed|has been deleted/i.test(text))return new AudioError('RECORDING_UNAVAILABLE','YouTube reports this recording as private or removed.',404);
   if(/Requested format.*not available|No video formats found|No formats found/i.test(text))return new AudioError('AUDIO_FORMAT_UNAVAILABLE','No supported direct audio-only format is available for this recording.',422);
@@ -30,7 +32,7 @@ export function extractionError(error, timeoutMs=90000) {
   return new AudioError('EXTRACTION_FAILED','The audio extractor failed to return playable audio. Check the diagnostic endpoint for the failing stage.',502,true);
 }
 export function publicError(error, stage='request') {
-  if(error instanceof AudioError)return {error:error.message,code:error.code,retryable:error.retryable,stage:error.stage};
+  if(error instanceof AudioError)return {error:error.message,code:error.code,retryable:error.retryable,stage:error.stage,...(error.retryAt?{retryAt:error.retryAt,retryAfterSeconds:Math.max(1,Math.ceil((error.retryAt-Date.now())/1000))}:{})};
   if(error?.name==='TimeoutError'||error?.name==='AbortError')return {error:'The audio provider request timed out.',code:'UPSTREAM_TIMEOUT',retryable:true,stage};
   if(Number.isInteger(error?.status))return {error:error.message,code:'REQUEST_REJECTED',retryable:[429,503,504].includes(error.status),stage};
   return {error:'The audio provider connection failed. Try again shortly.',code:'UPSTREAM_NETWORK_ERROR',retryable:true,stage};

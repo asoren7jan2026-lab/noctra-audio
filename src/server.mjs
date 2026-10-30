@@ -55,13 +55,13 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
     let stage='request';
     try {
       const url = new URL(req.url, 'http://audio.internal');
-      if (url.pathname === '/health' && req.method === 'GET') return send(res,200,{ok:true,...(healthState?{audioCheck:healthState.audioCheck}:{} )});
+      if (url.pathname === '/health' && req.method === 'GET') return send(res,200,{ok:true,provider:extractor.availability?.()||{available:true},...(healthState?{audioCheck:healthState.audioCheck}:{} )});
       if(url.pathname==='/test'&&req.method==='GET'){
         if(url.search)throw fail('The public diagnostic uses a fixed test recording. Use the authenticated internal test endpoint to choose another.',400);
         if(!healthState.audioCheck)startTest(testRecordingId);
         const result=healthState.audioCheck,pending=result.status==='running'||result.status==='pending';
         if(pending)res.setHeader('Retry-After','3');
-        return send(res,pending?202:result.ok?200:502,{service:'online',release:process.env.RENDER_GIT_COMMIT||null,configuration:{ytDlpVersion:process.env.YTDLP_VERSION||null,nodeVersion:process.version,audioOnly:true,preferredFormat:'AAC/M4A',relayChunkBytes:262144,extractionTimeoutMs:extractor.timeoutMs||null,maxConcurrentExtractions:extractor.concurrency||null},...result});
+        return send(res,pending?202:result.ok?200:502,{service:'online',release:process.env.RENDER_GIT_COMMIT||null,provider:extractor.availability?.()||{available:true},configuration:{ytDlpVersion:process.env.YTDLP_VERSION||null,nodeVersion:process.version,audioOnly:true,preferredFormat:'AAC/M4A',relayChunkBytes:262144,extractionTimeoutMs:extractor.timeoutMs||null,maxConcurrentExtractions:extractor.concurrency||null},...result});
       }
       if (url.pathname.startsWith('/internal/')) {
         stage='authentication';
@@ -114,6 +114,7 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
           // The selected format is pinned in the ticket. Refreshes must not change
           // the byte representation beneath an existing seek request.
           let record = await extractor.resolve(ticket.id,{formatId:ticket.formatId});
+          if(extractor.availability?.().stage==='audio_delivery')extractor.assertAvailable();
           if(await relayAudioChunks({record,range,method:req.method,res,extractor,ticket,fetchImpl,signal:abort.signal}))return;
           let upstream;
           for (let attempt = 0; attempt < 2; attempt++) {
@@ -145,7 +146,7 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
             const contentRange = upstream.headers.get('content-range'); if (contentRange) res.setHeader('Content-Range',contentRange);
             await upstream.body?.cancel(); res.writeHead(416);return res.end();
           }
-          if (![200,206].includes(upstream.status)) {await upstream.body?.cancel();throw new AudioError(upstream.status===429?'UPSTREAM_RATE_LIMIT':'AUDIO_ACCESS_DENIED','The audio provider returned HTTP '+upstream.status+' instead of audio.',upstream.status===429?429:502,upstream.status===429,stage);}
+          if (![200,206].includes(upstream.status)) {await upstream.body?.cancel();const failure=new AudioError(upstream.status===429?'UPSTREAM_RATE_LIMIT':'AUDIO_ACCESS_DENIED','The audio provider returned HTTP '+upstream.status+' instead of audio.',upstream.status===429?429:502,upstream.status===429,stage);extractor.pauseFor?.(failure);throw failure;}
           res.statusCode = upstream.status;res.setHeader('Content-Type',record.mimeType);res.setHeader('X-Content-Type-Options','nosniff');
           for (const header of ['content-length','content-range','accept-ranges','etag','last-modified']) {const value=upstream.headers.get(header);if(value)res.setHeader(header,value);}
           if (req.method === 'HEAD' || !upstream.body) {await upstream.body?.cancel();return res.end();}
@@ -157,7 +158,8 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
     } catch (error) {
       if (res.headersSent||res.destroyed) {res.destroy();return;}
       const result=publicError(error,stage),status=error.status||(['UPSTREAM_TIMEOUT','EXTRACTION_TIMEOUT'].includes(result.code)?504:502);
-      if ([429,503,504].includes(status)) res.setHeader('Retry-After',status===429?'60':'5');
+      if(result.retryAfterSeconds)res.setHeader('Retry-After',String(result.retryAfterSeconds));
+      else if ([429,503,504].includes(status)) res.setHeader('Retry-After',status===429?'60':'5');
       send(res,status,result);
     }
   });return server;

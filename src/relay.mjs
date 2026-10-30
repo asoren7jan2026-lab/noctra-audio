@@ -47,7 +47,7 @@ export async function relayAudioChunks({record,range,method,res,extractor,ticket
       if(attempt===0&&[403,410].includes(response.status)&&(!refreshUsed||refreshJob)){
         await response.body?.cancel();await refresh();continue;
       }
-      if(response.status===429){await response.body?.cancel();throw new AudioError('UPSTREAM_RATE_LIMIT','The audio provider is rate-limiting delivery. Retry later.',429,true,'audio_delivery');}
+      if(response.status===429){await response.body?.cancel();const failure=new AudioError('UPSTREAM_RATE_LIMIT','The audio provider is rate-limiting delivery. Retry later.',429,true,'audio_delivery');extractor.pauseFor?.(failure);throw failure;}
       if(response.status!==206){await response.body?.cancel();throw new AudioError('AUDIO_RANGE_REJECTED','The audio provider rejected the byte-range request (HTTP '+response.status+').',502,false,'audio_delivery');}
       if(response.headers.get('content-range')!=='bytes '+first+'-'+last+'/'+total){
         await response.body?.cancel();throw new AudioError('INCOMPLETE_AUDIO','The provider returned an incomplete audio range or changed its representation.',502,true,'audio_delivery');

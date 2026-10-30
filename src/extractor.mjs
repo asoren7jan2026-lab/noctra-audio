@@ -31,17 +31,29 @@ export function normalizeAudio(info, id, now = Date.now()) {
     thumbnail:info.thumbnail || '', duration:Number(info.duration) || 0,
     formatId:info.format_id, codec:info.acodec, bitrateKbps:info.abr || null,
     mimeType:mimeTypes[info.ext], sourceUrl:url.href, sourceExpiresAt, headers,
-    cacheUntil:Math.min(now + 120000, sourceExpiresAt ? sourceExpiresAt - 30000 : now + 60000),
+    cacheUntil:Math.min(now + 600000, sourceExpiresAt ? sourceExpiresAt - 60000 : now + 60000),
   };
 }
 
 export class Extractor {
-  constructor({run = runProcess, binary = process.env.YTDLP_BIN || 'yt-dlp', concurrency = 1, maxCache = 200, timeoutMs = Number(process.env.YTDLP_TIMEOUT_MS)||90000} = {}) {
+  constructor({run = runProcess, binary = process.env.YTDLP_BIN || 'yt-dlp', concurrency = 1, maxCache = 200, timeoutMs = Number(process.env.YTDLP_TIMEOUT_MS)||90000, now=Date.now} = {}) {
     this.run = run; this.binary = binary; this.concurrency = concurrency; this.maxCache = maxCache;
     this.timeoutMs=Math.max(10000,Math.min(150000,timeoutMs));
-    this.active = 0; this.cache = new Map(); this.pending = new Map();
+    this.active = 0; this.cache = new Map(); this.pending = new Map();this.now=now;this.pause=null;
+  }
+  availability(){
+    if(this.pause&&this.pause.retryAt<=this.now())this.pause=null;
+    return this.pause?{available:false,code:this.pause.code,message:this.pause.message,stage:this.pause.stage,retryAt:this.pause.retryAt,retryAfterSeconds:Math.max(1,Math.ceil((this.pause.retryAt-this.now())/1000))}:{available:true};
+  }
+  pauseFor(error){
+    if(!['UPSTREAM_RATE_LIMIT','PROVIDER_VERIFICATION_REQUIRED'].includes(error.code))return error;
+    error.retryAt=this.now()+600000;this.pause=error;return error;
+  }
+  assertAvailable(){
+    if(!this.availability().available){const error=new AudioError(this.pause.code,this.pause.message,this.pause.status,this.pause.retryable,this.pause.stage);error.retryAt=this.pause.retryAt;throw error;}
   }
   async command(extra) {
+    this.assertAvailable();
     if (this.active >= this.concurrency) throw new AudioError('EXTRACTOR_BUSY','The audio resolver is processing another recording. Retry shortly.',503,true);
     this.active++;
     try {
@@ -56,7 +68,7 @@ export class Extractor {
       ], {timeout:this.timeoutMs, maxBuffer:8*1024*1024, shell:false, windowsHide:true});
       try{return JSON.parse(stdout);}catch{throw new AudioError('INVALID_EXTRACTOR_RESPONSE','The extractor returned invalid metadata.',502);}
     } catch (error) {
-      const failure=extractionError(error,this.timeoutMs);
+      const failure=this.pauseFor(extractionError(error,this.timeoutMs));
       console.warn('NOCTRA_EXTRACTOR '+JSON.stringify({code:failure.code,exitCode:error.exitCode??null,diagnostic:diagnosticLine(error.stderr)}));
       throw failure;
     } finally {this.active--;}
@@ -73,11 +85,11 @@ export class Extractor {
     if (!validId(id) || (formatId && !validFormat(formatId))) throw Object.assign(new Error('Invalid recording identifier.'), {status:400});
     const key = id + ':' + (formatId || 'preferred');
     const cached = this.cache.get(key);
-    if (!force && cached?.cacheUntil > Date.now()) return cached;
+    if (!force && cached?.cacheUntil > this.now()) return cached;
     if (this.pending.has(key)) return this.pending.get(key);
     const job = (async () => {
       const info = await this.command(['-f', formatId || AUDIO_FORMAT, '--', 'https://music.youtube.com/watch?v=' + id]);
-      const record = normalizeAudio(info, id);
+      const record = normalizeAudio(info, id,this.now());
       this.cache.set(key, record); this.cache.set(id + ':' + record.formatId, record);
       while (this.cache.size > this.maxCache) this.cache.delete(this.cache.keys().next().value);
       return record;

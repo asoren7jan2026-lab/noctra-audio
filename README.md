@@ -76,9 +76,17 @@ rate limits, region restrictions, missing formats, TLS errors and timeouts are
 separate results. TLS verification stays enabled. The Site waits for Render to
 wake before sending the extraction request and preserves these error messages.
 
+The final extractor error takes precedence over earlier retry warnings. Provider
+verification and HTTP 429 pause new extractions across both catalog adapters for
+ten minutes, including forced refreshes and search. Responses include retryAt,
+retryAfterSeconds and Retry-After. A cooldown limits traffic; it does not promise
+that verification will clear when it expires. Valid cached sources can be reused
+for up to ten minutes, bounded by their signed expiry. No proxies, cookies or
+alternate clients are introduced to evade provider restrictions.
+
 ## Endpoints
 
-- GET /health: process health and the latest diagnostic status.
+- GET /health: process health, current provider availability and latest diagnostic.
 - GET /test: starts one diagnostic for NOCTRA_PROBE_ID on first access, immediately
   returns 202 while running, then reports extraction, full audio transfer and
   seeking separately. Refreshes reuse the result and do not run more extractors.
