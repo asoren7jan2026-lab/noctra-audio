@@ -55,13 +55,13 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
     let stage='request';
     try {
       const url = new URL(req.url, 'http://audio.internal');
-      if (url.pathname === '/health' && req.method === 'GET') return send(res,200,{ok:true,provider:extractor.availability?.()||{available:true},...(healthState?{audioCheck:healthState.audioCheck}:{} )});
+      if (url.pathname === '/health' && req.method === 'GET') return send(res,200,{ok:true,provider:extractor.availability?.()||{available:true},authentication:extractor.authentication?.()||{configured:false,publicRecordingsOnly:true},...(healthState?{audioCheck:healthState.audioCheck}:{} )});
       if(url.pathname==='/test'&&req.method==='GET'){
         if(url.search)throw fail('The public diagnostic uses a fixed test recording. Use the authenticated internal test endpoint to choose another.',400);
         if(!healthState.audioCheck)startTest(testRecordingId);
         const result=healthState.audioCheck,pending=result.status==='running'||result.status==='pending';
         if(pending)res.setHeader('Retry-After','3');
-        return send(res,pending?202:result.ok?200:502,{service:'online',release:process.env.RENDER_GIT_COMMIT||null,provider:extractor.availability?.()||{available:true},configuration:{ytDlpVersion:process.env.YTDLP_VERSION||null,nodeVersion:process.version,audioOnly:true,preferredFormat:'AAC/M4A',relayChunkBytes:262144,extractionTimeoutMs:extractor.timeoutMs||null,maxConcurrentExtractions:extractor.concurrency||null},...result});
+        return send(res,pending?202:result.ok?200:502,{service:'online',release:process.env.RENDER_GIT_COMMIT||null,provider:extractor.availability?.()||{available:true},authentication:extractor.authentication?.()||{configured:false,publicRecordingsOnly:true},configuration:{ytDlpVersion:process.env.YTDLP_VERSION||null,nodeVersion:process.version,audioOnly:true,preferredFormat:'AAC/M4A',relayChunkBytes:262144,extractionTimeoutMs:extractor.timeoutMs||null,maxConcurrentExtractions:extractor.concurrency||null},...result});
       }
       if (url.pathname.startsWith('/internal/')) {
         stage='authentication';

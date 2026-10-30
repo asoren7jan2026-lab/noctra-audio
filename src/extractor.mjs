@@ -1,5 +1,6 @@
 import {runProcess} from './process.mjs';
 import {AudioError,extractionError,diagnosticLine} from './errors.mjs';
+import {prepareYoutubeSession} from './session.mjs';
 export const AUDIO_FORMAT = 'bestaudio[vcodec=none][acodec!=none][ext=m4a][protocol=https]/bestaudio[vcodec=none][acodec!=none][protocol=https]';
 export const validId = id => typeof id === 'string' && /^[A-Za-z0-9_-]{11}$/.test(id);
 export const validFormat = format => typeof format === 'string' && /^[A-Za-z0-9_-]{1,32}$/.test(format);
@@ -12,7 +13,8 @@ export function mediaURL(value) {
   }
   return url;
 }
-export function normalizeAudio(info, id, now = Date.now()) {
+export function normalizeAudio(info, id, now = Date.now(), {authenticated=false}={}) {
+  if(authenticated&&(info.availability!=='public'||Number(info.age_limit)>=18))throw new AudioError('NONPUBLIC_RECORDING','Authenticated extraction is restricted to public recordings that do not require account or age verification.',403,false);
   if (info.id !== id || info.vcodec !== 'none' || !info.acodec || info.acodec === 'none' || info.is_live ||
       !validFormat(info.format_id) || !['m4a', 'webm', 'mp4', 'aac', 'mp3', 'ogg'].includes(info.ext)) {
     throw new AudioError('AUDIO_FORMAT_UNAVAILABLE','A direct audio-only format is unavailable for this recording.',422);
@@ -36,11 +38,13 @@ export function normalizeAudio(info, id, now = Date.now()) {
 }
 
 export class Extractor {
-  constructor({run = runProcess, binary = process.env.YTDLP_BIN || 'yt-dlp', concurrency = 1, maxCache = 200, timeoutMs = Number(process.env.YTDLP_TIMEOUT_MS)||90000, now=Date.now} = {}) {
+  #cookies;
+  constructor({run = runProcess, binary = process.env.YTDLP_BIN || 'yt-dlp', concurrency = 1, maxCache = 200, timeoutMs = Number(process.env.YTDLP_TIMEOUT_MS)||90000, now=Date.now, cookies=process.env.YTDLP_COOKIES||''} = {}) {
     this.run = run; this.binary = binary; this.concurrency = concurrency; this.maxCache = maxCache;
     this.timeoutMs=Math.max(10000,Math.min(150000,timeoutMs));
-    this.active = 0; this.cache = new Map(); this.pending = new Map();this.now=now;this.pause=null;
+    this.active = 0; this.cache = new Map(); this.pending = new Map();this.now=now;this.pause=null;this.#cookies=cookies;
   }
+  authentication(){return{configured:!!this.#cookies,publicRecordingsOnly:true};}
   availability(){
     if(this.pause&&this.pause.retryAt<=this.now())this.pause=null;
     return this.pause?{available:false,code:this.pause.code,message:this.pause.message,stage:this.pause.stage,retryAt:this.pause.retryAt,retryAfterSeconds:Math.max(1,Math.ceil((this.pause.retryAt-this.now())/1000))}:{available:true};
@@ -52,30 +56,34 @@ export class Extractor {
   assertAvailable(){
     if(!this.availability().available){const error=new AudioError(this.pause.code,this.pause.message,this.pause.status,this.pause.retryable,this.pause.stage);error.retryAt=this.pause.retryAt;throw error;}
   }
-  async command(extra) {
+  async command(extra,{authenticate=true}={}) {
     this.assertAvailable();
     if (this.active >= this.concurrency) throw new AudioError('EXTRACTOR_BUSY','The audio resolver is processing another recording. Retry shortly.',503,true);
     this.active++;
+    let session;
     try {
+      session=authenticate?await prepareYoutubeSession(this.#cookies):null;
       const {stdout} = await this.run(this.binary, [
         '--ignore-config', '--no-playlist', '--skip-download', '--dump-single-json', '--no-progress',
         '--force-ipv4','--socket-timeout', '20', '--retries', '3', '--extractor-retries', '2',
         '--retry-sleep','http:exp=1:8','--retry-sleep','extractor:exp=1:8',
         '--no-js-runtimes','--js-runtimes', 'node:'+process.execPath,
         '--extractor-args','youtube:player_client=default',
+        ...(session?['--cookies',session.path]:[]),
         ...(process.env.YTDLP_USER_AGENT&&process.env.YTDLP_USER_AGENT.length<=512&&!/[\r\n]/.test(process.env.YTDLP_USER_AGENT)?['--add-headers','User-Agent:'+process.env.YTDLP_USER_AGENT]:[]),
         ...(process.env.YTDLP_USE_SYSTEM_CA === '1' ? ['--compat-options','no-certifi'] : []), ...extra,
       ], {timeout:this.timeoutMs, maxBuffer:8*1024*1024, shell:false, windowsHide:true});
       try{return JSON.parse(stdout);}catch{throw new AudioError('INVALID_EXTRACTOR_RESPONSE','The extractor returned invalid metadata.',502);}
     } catch (error) {
       const failure=this.pauseFor(extractionError(error,this.timeoutMs));
+      if(authenticate&&this.#cookies&&failure.code==='PROVIDER_VERIFICATION_REQUIRED')failure.message='YouTube rejected the configured server session and still requires verification. Authentication has not restored access.';
       console.warn('NOCTRA_EXTRACTOR '+JSON.stringify({code:failure.code,exitCode:error.exitCode??null,diagnostic:diagnosticLine(error.stderr)}));
       throw failure;
-    } finally {this.active--;}
+    } finally {await session?.cleanup().catch(()=>{});this.active--;}
   }
   async search(query) {
     if (typeof query !== 'string' || !query.trim() || query.length > 160) throw Object.assign(new Error('Enter a query of 1–160 characters.'), {status:400});
-    const result = await this.command(['--flat-playlist', '--', 'ytsearch5:' + query.trim()]);
+    const result = await this.command(['--flat-playlist', '--', 'ytsearch5:' + query.trim()],{authenticate:false});
     return (result.entries || []).filter(item => validId(item.id)).map(item => ({
       id:item.id, title:item.track || item.title || '', artist:item.artist || item.uploader || item.channel || '',
       thumbnail:item.thumbnail || item.thumbnails?.at(-1)?.url || '', duration:Number(item.duration) || 0,
@@ -89,7 +97,7 @@ export class Extractor {
     if (this.pending.has(key)) return this.pending.get(key);
     const job = (async () => {
       const info = await this.command(['-f', formatId || AUDIO_FORMAT, '--', 'https://music.youtube.com/watch?v=' + id]);
-      const record = normalizeAudio(info, id,this.now());
+      const record = normalizeAudio(info, id,this.now(),{authenticated:!!this.#cookies});
       this.cache.set(key, record); this.cache.set(id + ':' + record.formatId, record);
       while (this.cache.size > this.maxCache) this.cache.delete(this.cache.keys().next().value);
       return record;

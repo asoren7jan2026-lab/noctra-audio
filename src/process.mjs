@@ -3,7 +3,7 @@ import {spawn} from 'node:child_process';
 // Kill the complete process group on timeout, including JavaScript solver children.
 export function runProcess(binary,args,{timeout=90000,maxBuffer=8*1024*1024,...options}={}) {
   return new Promise((resolve,reject)=>{
-    const childEnv={...process.env};delete childEnv.AUDIO_API_KEY;delete childEnv.AUDIO_SIGNING_KEY;
+    const childEnv={...process.env};delete childEnv.AUDIO_API_KEY;delete childEnv.AUDIO_SIGNING_KEY;delete childEnv.YTDLP_COOKIES;
     const child=spawn(binary,args,{...options,env:childEnv,shell:false,windowsHide:true,detached:process.platform!=='win32',stdio:['ignore','pipe','pipe']});
     let stdout=[],bytes=0,stderr='',failure,settled=false,forceTimer,finishTimer;
     const stop=signal=>{try{if(child.pid&&process.platform!=='win32')process.kill(-child.pid,signal);else child.kill(signal);}catch{}};

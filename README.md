@@ -35,6 +35,30 @@ No database migration or library ID conversion is required. Test on the actual
 host before enabling it: an extractor metadata response alone is not proof that
 full audio is retrievable.
 
+## Optional private YouTube session
+
+The service can use an explicitly supplied YouTube session through the private
+Render environment variable `YTDLP_COOKIES`. It must contain a YouTube-only
+Netscape cookie file from an account you control. Configure it directly in
+Render's environment settings; never paste session cookies into chat, commit
+them, or put them in frontend settings. Session cookies grant account access.
+Prefer a dedicated account. No Google password is accepted or required here.
+
+Session support is disabled when the variable is absent. `/health` reports only
+whether it is configured, not the contents. Each extraction writes a temporary
+0600 cookie jar in a 0700 directory, passes only its path to yt-dlp, removes the
+raw secret from the subprocess environment and deletes the jar afterwards.
+Catalog search stays unauthenticated. Authenticated resolution only accepts
+metadata explicitly marked public and rejects private, subscriber-only,
+age-restricted and unknown-availability recordings.
+
+Supplying a session is an authentication attempt, not a guarantee that YouTube
+will accept this host or account. A verification rejection still stops requests
+and reports failure. The service does not solve verification challenges, rotate
+IP addresses or introduce another provider's proxy. After an authorized session
+is configured, use the diagnostic to verify extraction, complete audio and seek
+delivery; metadata alone is insufficient.
+
 ## Render deployment
 
 The repository-root `render.yaml` configures a Docker web service in Singapore,
