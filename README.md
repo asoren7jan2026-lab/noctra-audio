@@ -1,9 +1,9 @@
 # NOCTRA YouTube audio service
 
 This Node service is integrated with NOCTRA's authenticated playback API. It is
-included in the source repository with a Render Docker Blueprint. External
-Render is connected. Deployment is pending a Render-accessible source repository
-and a successful live audio test.
+deployed on Render at https://noctra-audio.onrender.com. Its standalone source is
+https://github.com/asoren7jan2026-lab/noctra-audio. The NOCTRA server stores its
+connection URL and API key in production runtime configuration.
 
 The live Site uses one persistent HTMLAudioElement. YouTube video runtimes,
 iframes, player scripts and floating video UI have been removed. The existing
@@ -55,7 +55,10 @@ marking direct YouTube playback ready.
 
 ## Endpoints
 
-- GET /health: service health.
+- GET /health: service health and the result of an optional one-shot audio check.
+  Set NOCTRA_PROBE_ID to a canonical recording ID to verify a complete audio body
+  and a byte-range seek after startup. The check reports its status without
+  exposing a key or signed URL. A healthy process alone does not verify playback.
 - POST /internal/search: authenticated query search; falls back to general YouTube
   search. NOCTRA normally uses its existing YouTube Music catalog.
 - POST /internal/resolve: authenticated videoId (or first-result query), metadata

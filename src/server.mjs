@@ -29,7 +29,7 @@ function send(res, status, data) {
   res.writeHead(status, {'Content-Type':'application/json', 'Cache-Control':'no-store', 'Referrer-Policy':'no-referrer'});
   res.end(JSON.stringify(data));
 }
-export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOrigin, extractor = new Extractor(), fetchImpl = fetch} = {}) {
+export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOrigin, healthState, extractor = new Extractor(), fetchImpl = fetch} = {}) {
   if (!apiKey || apiKey.length < 32 || !signingKey || signingKey.length < 32 || apiKey === signingKey) throw new Error('Set distinct API and signing secrets of at least 32 characters.');
   const base = new URL(publicBaseURL); if (!['http:','https:'].includes(base.protocol)) throw new Error('Invalid public audio service URL.');
   const rates = new Map(); let activeStreams = 0;
@@ -43,7 +43,7 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
   return createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://audio.internal');
-      if (url.pathname === '/health' && req.method === 'GET') return send(res,200,{ok:true});
+      if (url.pathname === '/health' && req.method === 'GET') return send(res,200,{ok:true,...(healthState?{audioCheck:healthState.audioCheck}:{} )});
       if (url.pathname.startsWith('/internal/')) {
         if (!equal(req.headers.authorization || '', 'Bearer ' + apiKey)) throw fail('Unauthorized.',401);
         // This identity is supplied only by NOCTRA's authenticated server.
@@ -134,10 +134,11 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
   });
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const healthState={audioCheck:validId(process.env.NOCTRA_PROBE_ID)?{status:'pending',recordingId:process.env.NOCTRA_PROBE_ID}:null};
   const server = createAudioServer({apiKey:process.env.AUDIO_API_KEY,signingKey:process.env.AUDIO_SIGNING_KEY,
-    publicBaseURL:process.env.PUBLIC_AUDIO_BASE || process.env.RENDER_EXTERNAL_URL,allowedOrigin:process.env.NOCTRA_ORIGIN});
+    publicBaseURL:process.env.PUBLIC_AUDIO_BASE || process.env.RENDER_EXTERNAL_URL,allowedOrigin:process.env.NOCTRA_ORIGIN,healthState});
   server.listen(Number(process.env.PORT || 8080),'0.0.0.0',()=>{
     console.log('NOCTRA audio service listening.');
-    if(validId(process.env.NOCTRA_PROBE_ID))void probeAudioGateway({port:server.address().port,apiKey:process.env.AUDIO_API_KEY,recordingId:process.env.NOCTRA_PROBE_ID,allowedOrigin:process.env.NOCTRA_ORIGIN});
+    if(validId(process.env.NOCTRA_PROBE_ID))void probeAudioGateway({port:server.address().port,apiKey:process.env.AUDIO_API_KEY,recordingId:process.env.NOCTRA_PROBE_ID,allowedOrigin:process.env.NOCTRA_ORIGIN}).then(result=>{healthState.audioCheck=result;});
   });
 }

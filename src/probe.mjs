@@ -15,9 +15,11 @@ export async function probeAudioGateway({port, apiKey, recordingId, allowedOrigi
     const range=seek.headers.get('content-range');
     const chunk=await seek.arrayBuffer();
     if(seek.status!==206||chunk.byteLength!==1024||range!=='bytes 1024-2047/'+bytes) throw new Error('seek_failed');
-    console.log('NOCTRA_AUDIO_PROBE '+JSON.stringify({ok:true,recordingId,bytes,mimeType:metadata.mimeType,seekStatus:seek.status}));
+    const result={ok:true,status:'passed',recordingId,bytes,mimeType:metadata.mimeType,seekStatus:seek.status};
+    console.log('NOCTRA_AUDIO_PROBE '+JSON.stringify(result));return result;
   } catch(error) {
     const reason=/^(resolve_status_\d+|media_status_\d+|incomplete_audio|probe_size_limit|seek_failed)$/.test(error.message)?error.message:'network_or_timeout';
-    console.warn('NOCTRA_AUDIO_PROBE '+JSON.stringify({ok:false,recordingId,reason}));
+    const result={ok:false,status:'failed',recordingId,reason};
+    console.warn('NOCTRA_AUDIO_PROBE '+JSON.stringify(result));return result;
   }
 }
