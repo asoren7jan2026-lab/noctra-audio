@@ -1,0 +1,79 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {once} from 'node:events';
+import {Extractor,normalizeAudio} from '../src/extractor.mjs';
+import {AudioError,extractionError,diagnosticLine} from '../src/errors.mjs';
+import {runProcess} from '../src/process.mjs';
+import {createAudioServer} from '../src/server.mjs';
+import {probeAudioGateway} from '../src/probe.mjs';
+const id='AbCdEfGhI_1',apiKey='reliability-api-abcdefghijklmnopqrstuvwxyz',signingKey='reliability-sign-abcdefghijklmnopqrstuvwxyz';
+const info={id,title:'Song',artist:'Artist',duration:210,vcodec:'none',acodec:'mp4a.40.2',ext:'m4a',format_id:'140',url:'https://rr1.googlevideo.com/videoplayback?expire='+Math.floor((Date.now()+3600000)/1000)};
+
+test('classifies actual upstream failures without exposing upstream URLs',()=>{
+ const cases=[
+  [{code:'ENOENT'},'EXTRACTOR_NOT_INSTALLED',503,false],
+  [{killed:true},'EXTRACTION_TIMEOUT',504,true],
+  [{stderr:"ERROR: Sign in to confirm you're not a bot"},'PROVIDER_VERIFICATION_REQUIRED',403,false],
+  [{stderr:'ERROR: HTTP Error 429: Too Many Requests'},'UPSTREAM_RATE_LIMIT',429,true],
+  [{stderr:'ERROR: The uploader has not made this video available in your country'},'REGION_RESTRICTED',451,false],
+  [{stderr:'ERROR: Requested format is not available'},'AUDIO_FORMAT_UNAVAILABLE',422,false],
+  [{stderr:'ERROR: Unable to download webpage: connection reset'},'UPSTREAM_NETWORK_ERROR',502,true],
+ ];
+ for(const [raw,code,status,retryable] of cases){const result=extractionError(raw);assert.equal(result.code,code);assert.equal(result.status,status);assert.equal(result.retryable,retryable);}
+ const line=diagnosticLine('WARNING: earlier\nERROR: source https://rr1.googlevideo.com/playback?sig=secret token=private');
+ assert.ok(!line.includes('sig=secret'));assert.ok(!line.includes('token=private'));assert.ok(!line.includes('https://'));
+});
+
+test('one free-tier process is allowed; a failed extraction does not poison later requests',async()=>{
+ let release;
+ const pending=new Promise(resolve=>{release=resolve});
+ let calls=0;
+ const extractor=new Extractor({run:async()=>{calls++;if(calls===1){await pending;throw Object.assign(new Error('failed'),{killed:true});}return{stdout:JSON.stringify(info)};}});
+ const first=extractor.resolve(id);const duplicate=extractor.resolve(id);
+ const rejectedFirst=assert.rejects(first,e=>e.code==='EXTRACTION_TIMEOUT');
+ const rejectedDuplicate=assert.rejects(duplicate,e=>e.code==='EXTRACTION_TIMEOUT');
+ await assert.rejects(()=>extractor.resolve('AbCdEfGhI_2'),e=>e.code==='EXTRACTOR_BUSY'&&e.status===503);
+ release();await Promise.all([rejectedFirst,rejectedDuplicate]);assert.equal(calls,1);
+ assert.equal((await extractor.resolve(id)).id,id);assert.equal(calls,2);
+});
+
+test('real subprocess deadlines and output limits stop the child process',async()=>{
+ const started=Date.now();
+ await assert.rejects(()=>runProcess(process.execPath,['-e','process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'],{timeout:150}),e=>e.code==='ETIMEDOUT'&&e.killed);
+ assert.ok(Date.now()-started<3000);
+ await assert.rejects(()=>runProcess(process.execPath,['-e','process.stdout.write("x".repeat(2000000))'],{timeout:3000,maxBuffer:512}),e=>e.code==='MAXBUFFER');
+});
+
+async function serve(options,fn){
+ const server=createAudioServer({apiKey,signingKey,publicBaseURL:'https://audio.example.test',allowedOrigin:'https://noctra.example.test',testRecordingId:id,...options});
+ server.listen(0,'127.0.0.1');await once(server,'listening');
+ try{await fn('http://127.0.0.1:'+server.address().port);}
+ finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+}
+test('public diagnostic verifies a complete 206 body and seeking once; refreshes reuse its result',async()=>{
+ const size=262144;let resolves=0,done;const completion=new Promise(resolve=>{done=resolve});
+ await serve({
+  extractor:{resolve:async(_,options)=>{if(!options?.formatId)resolves++;return normalizeAudio({...info,url:info.url+'&clen='+size},id);}},
+  fetchImpl:async(_,options)=>{const range=options.headers.Range;return new Response(new Uint8Array(range?1024:size),{status:206,headers:{'Content-Type':'audio/mp4','Content-Length':String(range?1024:size),'Content-Range':range?'bytes 1024-2047/'+size:'bytes 0-'+(size-1)+'/'+size,'Accept-Ranges':'bytes'}});},
+  runProbe:async options=>{try{return await probeAudioGateway(options);}finally{done();}}
+ },async root=>{
+  let r=await fetch(root+'/test');assert.equal(r.status,202);
+  await completion;
+  r=await fetch(root+'/test');const result=await r.json();assert.equal(r.status,200);assert.equal(result.ok,true);assert.equal(result.bytes,size);assert.equal(result.checks.audioTransfer,'passed');assert.equal(result.checks.seeking,'passed');assert.ok(result.metadata.audioUrl.startsWith('https://audio.example.test/audio/'));
+  await fetch(root+'/test');assert.equal(resolves,1);
+  r=await fetch(root+'/test?videoId=another');assert.equal(r.status,400);assert.equal(resolves,1);
+  r=await fetch(root+'/internal/test',{method:'POST',body:'{}'});assert.equal(r.status,401);
+ });
+});
+
+test('diagnostic identifies extraction failure and preserves its actionable API code',async()=>{
+ let done;const completion=new Promise(resolve=>{done=resolve});
+ await serve({extractor:{resolve:async()=>{throw new AudioError('PROVIDER_VERIFICATION_REQUIRED','YouTube requires verification for this server request.',403);}},
+  runProbe:async options=>{try{return await probeAudioGateway(options);}finally{done();}}
+ },async root=>{
+  let r=await fetch(root+'/internal/resolve',{method:'POST',headers:{Authorization:'Bearer '+apiKey},body:JSON.stringify({videoId:id})});
+  const failure=await r.json();assert.equal(r.status,403);assert.equal(failure.code,'PROVIDER_VERIFICATION_REQUIRED');assert.equal(failure.retryable,false);assert.equal(failure.stage,'extraction');
+  await fetch(root+'/test');await completion;
+  r=await fetch(root+'/test');const result=await r.json();assert.equal(r.status,502);assert.equal(result.stage,'extraction');assert.equal(result.error.code,'PROVIDER_VERIFICATION_REQUIRED');assert.equal(result.checks.audioTransfer,'not_run');assert.ok(!JSON.stringify(result).includes(apiKey));
+ });
+});

@@ -53,12 +53,40 @@ Streaming counts toward Render traffic limits; this free configuration is for
 initial validation. Verify full audio and seeking on the deployed host before
 marking direct YouTube playback ready.
 
+## Extraction settings
+
+The Docker build pins yt-dlp 2026.10.26 with its default dependencies, including
+the EJS components, and enables the container's exact Node executable for the
+JavaScript challenge. It uses yt-dlp's maintained default YouTube clients; it
+does not force an outdated Android profile or try every client.
+
+Requests use IPv4, a 20-second socket timeout, three HTTP retries and two known
+extractor retries with exponential backoff capped at eight seconds. The process
+has a 90-second total deadline and one concurrent extraction on the Free plan.
+On timeout the process group, including solver children, is terminated.
+YTDLP_TIMEOUT_MS optionally changes the deadline between 10 and 150 seconds.
+
+The format selector requires vcodec=none, a nonempty audio codec and direct HTTPS.
+It prefers M4A/AAC, then another audio-only format. It never selects a mixed
+audio/video fallback. The default user-agent follows the pinned yt-dlp release;
+an operator can provide YTDLP_USER_AGENT as a validated single-line override.
+
+Failures return error, code, retryable and stage. Verification requirements,
+rate limits, region restrictions, missing formats, TLS errors and timeouts are
+separate results. TLS verification stays enabled. The Site waits for Render to
+wake before sending the extraction request and preserves these error messages.
+
 ## Endpoints
 
-- GET /health: service health and the result of an optional one-shot audio check.
-  Set NOCTRA_PROBE_ID to a canonical recording ID to verify a complete audio body
-  and a byte-range seek after startup. The check reports its status without
-  exposing a key or signed URL. A healthy process alone does not verify playback.
+- GET /health: process health and the latest diagnostic status.
+- GET /test: starts one diagnostic for NOCTRA_PROBE_ID on first access, immediately
+  returns 202 while running, then reports extraction, full audio transfer and
+  seeking separately. Refreshes reuse the result and do not run more extractors.
+  A successful result contains basic metadata and a short-lived gateway audio URL.
+  Keys and raw signed CDN URLs are never returned. It does not run at startup.
+- POST /internal/test: authenticated JSON videoId starts a fresh diagnostic.
+  This is the only way to choose another recording or rerun it without a restart.
+  GET /test shows its progress. The public test does not accept arbitrary queries.
 - POST /internal/search: authenticated query search; falls back to general YouTube
   search. NOCTRA normally uses its existing YouTube Music catalog.
 - POST /internal/resolve: authenticated videoId (or first-result query), metadata
@@ -76,3 +104,6 @@ an upstream transport and do not assert that YouTube accepts a new host's IP.
 
 Five test groups cover format/host validation, extraction de-duplication, signed
 tickets, auth, expiry, seeking, upstream refresh, CORS and truncated audio.
+Five additional groups cover error classification, capacity recovery, real
+subprocess termination, complete 206 audio delivery, cached diagnostics and
+propagation of provider verification errors.

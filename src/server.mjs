@@ -5,6 +5,7 @@ import {pipeline} from 'node:stream/promises';
 import {pathToFileURL} from 'node:url';
 import {Extractor, mediaURL, validId, validFormat} from './extractor.mjs';
 import {probeAudioGateway} from './probe.mjs';
+import {AudioError,publicError} from './errors.mjs';
 
 const fail = (message, status = 400) => Object.assign(new Error(message), {status});
 const hash = value => createHash('sha256').update(String(value)).digest();
@@ -29,10 +30,19 @@ function send(res, status, data) {
   res.writeHead(status, {'Content-Type':'application/json', 'Cache-Control':'no-store', 'Referrer-Policy':'no-referrer'});
   res.end(JSON.stringify(data));
 }
-export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOrigin, healthState, extractor = new Extractor(), fetchImpl = fetch} = {}) {
+export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOrigin, healthState={audioCheck:null}, testRecordingId=process.env.NOCTRA_PROBE_ID||'JGwKGuC9mdc', runProbe=probeAudioGateway, extractor = new Extractor(), fetchImpl = fetch} = {}) {
   if (!apiKey || apiKey.length < 32 || !signingKey || signingKey.length < 32 || apiKey === signingKey) throw new Error('Set distinct API and signing secrets of at least 32 characters.');
   const base = new URL(publicBaseURL); if (!['http:','https:'].includes(base.protocol)) throw new Error('Invalid public audio service URL.');
-  const rates = new Map(); let activeStreams = 0;
+  const rates = new Map(); let activeStreams = 0,diagnosticJob=null;
+  const startTest=id=>{
+    if(!validId(id))throw new AudioError('INVALID_RECORDING_ID','A canonical 11-character recording ID is required.',400,false,'diagnostic');
+    if(diagnosticJob)return;
+    healthState.audioCheck={status:'running',stage:'extraction',recordingId:id,startedAt:new Date().toISOString()};
+    diagnosticJob=runProbe({port:server.address().port,apiKey,recordingId:id,allowedOrigin,onProgress:value=>{healthState.audioCheck=value;}})
+      .then(result=>{healthState.audioCheck=result;})
+      .catch(error=>{healthState.audioCheck={ok:false,status:'failed',stage:'diagnostic',recordingId:id,error:publicError(error,'diagnostic')};})
+      .finally(()=>{diagnosticJob=null;});
+  };
   const limit = key => {
     const now = Date.now(), old = rates.get(key), item = old && old.until > now ? old : {count:0,until:now+60000};
     if (++item.count > 30) throw fail('Too many audio requests. Try again shortly.',429);
@@ -40,18 +50,33 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
     if (rates.size > 2000) for (const [name,entry] of rates) if (entry.until <= now) rates.delete(name);
     if (rates.size > 3000) rates.delete(rates.keys().next().value);
   };
-  return createServer(async (req, res) => {
+  const server=createServer(async (req, res) => {
+    let stage='request';
     try {
       const url = new URL(req.url, 'http://audio.internal');
       if (url.pathname === '/health' && req.method === 'GET') return send(res,200,{ok:true,...(healthState?{audioCheck:healthState.audioCheck}:{} )});
+      if(url.pathname==='/test'&&req.method==='GET'){
+        if(url.search)throw fail('The public diagnostic uses a fixed test recording. Use the authenticated internal test endpoint to choose another.',400);
+        if(!healthState.audioCheck)startTest(testRecordingId);
+        const result=healthState.audioCheck,pending=result.status==='running'||result.status==='pending';
+        if(pending)res.setHeader('Retry-After','3');
+        return send(res,pending?202:result.ok?200:502,{service:'online',release:process.env.RENDER_GIT_COMMIT||null,configuration:{ytDlpVersion:process.env.YTDLP_VERSION||null,nodeVersion:process.version,audioOnly:true,preferredFormat:'AAC/M4A',extractionTimeoutMs:extractor.timeoutMs||null,maxConcurrentExtractions:extractor.concurrency||null},...result});
+      }
       if (url.pathname.startsWith('/internal/')) {
+        stage='authentication';
         if (!equal(req.headers.authorization || '', 'Bearer ' + apiKey)) throw fail('Unauthorized.',401);
         // This identity is supplied only by NOCTRA's authenticated server.
         limit('resolve:' + (req.headers['x-noctra-user'] || req.socket.remoteAddress || 'unknown'));
+        if(url.pathname==='/internal/test'&&req.method==='POST'){
+          const input=await body(req);
+          if(diagnosticJob)throw new AudioError('DIAGNOSTIC_BUSY','An audio diagnostic is already running. Read /test for its progress.',503,true,'diagnostic');
+          startTest(input.videoId||testRecordingId);res.setHeader('Location','/test');return send(res,202,healthState.audioCheck);
+        }
         if (url.pathname === '/internal/search' && req.method === 'POST') {
           const input = await body(req); return send(res,200,{tracks:await extractor.search(input.query)});
         }
         if (url.pathname === '/internal/resolve' && req.method === 'POST') {
+          stage='extraction';
           const input = await body(req);
           let id = input.videoId;
           // Query mode chooses the first candidate. The normal UI should search,
@@ -68,6 +93,7 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
         throw fail('Unknown audio endpoint.',404);
       }
       if (url.pathname.startsWith('/audio/') && ['GET','HEAD','OPTIONS'].includes(req.method)) {
+        stage='audio_delivery';
         const origin = req.headers.origin;
         if (origin && origin !== allowedOrigin) throw fail('This origin is not allowed.',403);
         if (origin) {res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Vary','Origin');}
@@ -92,7 +118,7 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
             let target = record.sourceUrl;
             for (let redirect = 0; redirect < 3; redirect++) {
               mediaURL(target); // Never accept an arbitrary proxy URL from clients.
-              const timer = setTimeout(()=>abort.abort(),15000);
+              const timer = setTimeout(()=>abort.abort(),30000);
               try {upstream = await fetchImpl(target,{method:req.method,headers:{...record.headers,...(range?{Range:range}:{}),'Accept-Encoding':'identity'},redirect:'manual',signal:abort.signal});}
               finally {clearTimeout(timer);} // Header timeout must not truncate songs.
               if ([301,302,303,307,308].includes(upstream.status)) {
@@ -112,12 +138,12 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
           const rangeTotal=Number(upstream.headers.get('content-range')?.match(/\/(\d+)$/)?.[1]);
           const fullLength=upstream.status===200?Number(upstream.headers.get('content-length')):0;
           const observedBytes=rangeTotal||fullLength;
-          if(expectedBytes>0&&observedBytes>0&&observedBytes!==expectedBytes){await upstream.body?.cancel();throw fail('The provider returned an incomplete audio source. Try another recording.',502);}
+          if(expectedBytes>0&&observedBytes>0&&observedBytes!==expectedBytes){await upstream.body?.cancel();throw new AudioError('INCOMPLETE_AUDIO','The provider returned an incomplete audio source. Try another recording.',502,true,stage);}
           if (upstream.status === 416) {
             const contentRange = upstream.headers.get('content-range'); if (contentRange) res.setHeader('Content-Range',contentRange);
             await upstream.body?.cancel(); res.writeHead(416);return res.end();
           }
-          if (![200,206].includes(upstream.status)) {await upstream.body?.cancel();throw fail('The audio source is unavailable. Resolve the recording again.',502);}
+          if (![200,206].includes(upstream.status)) {await upstream.body?.cancel();throw new AudioError(upstream.status===429?'UPSTREAM_RATE_LIMIT':'AUDIO_ACCESS_DENIED','The audio provider returned HTTP '+upstream.status+' instead of audio.',upstream.status===429?429:502,upstream.status===429,stage);}
           res.statusCode = upstream.status;res.setHeader('Content-Type',record.mimeType);res.setHeader('X-Content-Type-Options','nosniff');
           for (const header of ['content-length','content-range','accept-ranges','etag','last-modified']) {const value=upstream.headers.get(header);if(value)res.setHeader(header,value);}
           if (req.method === 'HEAD' || !upstream.body) {await upstream.body?.cancel();return res.end();}
@@ -127,18 +153,18 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
       }
       throw fail('Not found.',404);
     } catch (error) {
-      if (res.headersSent) {res.destroy();return;}
-      if (error.status === 429 || error.status === 503) res.setHeader('Retry-After','5');
-      send(res,error.status || 502,{error:error.status ? error.message : 'Audio request failed. Try again shortly.'});
+      if (res.headersSent||res.destroyed) {res.destroy();return;}
+      const result=publicError(error,stage),status=error.status||(['UPSTREAM_TIMEOUT','EXTRACTION_TIMEOUT'].includes(result.code)?504:502);
+      if ([429,503,504].includes(status)) res.setHeader('Retry-After',status===429?'60':'5');
+      send(res,status,result);
     }
-  });
+  });return server;
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const healthState={audioCheck:validId(process.env.NOCTRA_PROBE_ID)?{status:'pending',recordingId:process.env.NOCTRA_PROBE_ID}:null};
+  const healthState={audioCheck:null};
   const server = createAudioServer({apiKey:process.env.AUDIO_API_KEY,signingKey:process.env.AUDIO_SIGNING_KEY,
     publicBaseURL:process.env.PUBLIC_AUDIO_BASE || process.env.RENDER_EXTERNAL_URL,allowedOrigin:process.env.NOCTRA_ORIGIN,healthState});
   server.listen(Number(process.env.PORT || 8080),'0.0.0.0',()=>{
     console.log('NOCTRA audio service listening.');
-    if(validId(process.env.NOCTRA_PROBE_ID))void probeAudioGateway({port:server.address().port,apiKey:process.env.AUDIO_API_KEY,recordingId:process.env.NOCTRA_PROBE_ID,allowedOrigin:process.env.NOCTRA_ORIGIN}).then(result=>{healthState.audioCheck=result;});
   });
 }

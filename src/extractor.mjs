@@ -1,7 +1,6 @@
-import {execFile} from 'node:child_process';
-import {promisify} from 'node:util';
-const execute = promisify(execFile);
-export const AUDIO_FORMAT = 'bestaudio[ext=m4a][protocol=https]/bestaudio[protocol=https]';
+import {runProcess} from './process.mjs';
+import {AudioError,extractionError,diagnosticLine} from './errors.mjs';
+export const AUDIO_FORMAT = 'bestaudio[vcodec=none][acodec!=none][ext=m4a][protocol=https]/bestaudio[vcodec=none][acodec!=none][protocol=https]';
 export const validId = id => typeof id === 'string' && /^[A-Za-z0-9_-]{11}$/.test(id);
 export const validFormat = format => typeof format === 'string' && /^[A-Za-z0-9_-]{1,32}$/.test(format);
 
@@ -9,19 +8,19 @@ export function mediaURL(value) {
   const url = new URL(value);
   if (url.protocol !== 'https:' || url.username || url.password || url.port ||
       !(url.hostname === 'googlevideo.com' || url.hostname.endsWith('.googlevideo.com'))) {
-    throw new Error('The extractor returned an unsupported media host.');
+    throw new AudioError('UNSUPPORTED_MEDIA_HOST','The extractor returned an unsupported audio host.');
   }
   return url;
 }
 export function normalizeAudio(info, id, now = Date.now()) {
   if (info.id !== id || info.vcodec !== 'none' || !info.acodec || info.acodec === 'none' || info.is_live ||
       !validFormat(info.format_id) || !['m4a', 'webm', 'mp4', 'aac', 'mp3', 'ogg'].includes(info.ext)) {
-    throw new Error('A direct audio-only format is unavailable for this recording.');
+    throw new AudioError('AUDIO_FORMAT_UNAVAILABLE','A direct audio-only format is unavailable for this recording.',422);
   }
   const url = mediaURL(info.url);
   const expiry = Number(url.searchParams.get('expire')) * 1000;
   const sourceExpiresAt = Number.isFinite(expiry) && expiry > 0 ? expiry : null;
-  if (sourceExpiresAt && sourceExpiresAt < now + 30000) throw new Error('The extracted audio URL is already expiring.');
+  if (sourceExpiresAt && sourceExpiresAt < now + 30000) throw new AudioError('SOURCE_EXPIRED','The extracted audio URL is already expiring. Resolve it again.',502,true);
   const mimeTypes = {m4a:'audio/mp4',mp4:'audio/mp4',webm:'audio/webm',aac:'audio/aac',mp3:'audio/mpeg',ogg:'audio/ogg'};
   const headers = {};
   for (const [key, value] of Object.entries(info.http_headers || {})) {
@@ -37,27 +36,29 @@ export function normalizeAudio(info, id, now = Date.now()) {
 }
 
 export class Extractor {
-  constructor({run = execute, binary = process.env.YTDLP_BIN || 'yt-dlp', concurrency = 2, maxCache = 200} = {}) {
+  constructor({run = runProcess, binary = process.env.YTDLP_BIN || 'yt-dlp', concurrency = 1, maxCache = 200, timeoutMs = Number(process.env.YTDLP_TIMEOUT_MS)||90000} = {}) {
     this.run = run; this.binary = binary; this.concurrency = concurrency; this.maxCache = maxCache;
+    this.timeoutMs=Math.max(10000,Math.min(150000,timeoutMs));
     this.active = 0; this.cache = new Map(); this.pending = new Map();
   }
   async command(extra) {
-    if (this.active >= this.concurrency) throw Object.assign(new Error('Audio resolver is busy. Try again shortly.'), {status:503});
+    if (this.active >= this.concurrency) throw new AudioError('EXTRACTOR_BUSY','The audio resolver is processing another recording. Retry shortly.',503,true);
     this.active++;
     try {
       const {stdout} = await this.run(this.binary, [
         '--ignore-config', '--no-playlist', '--skip-download', '--dump-single-json', '--no-progress',
-        '--socket-timeout', '10', '--retries', '1', '--extractor-retries', '1', '--js-runtimes', 'node',
+        '--force-ipv4','--socket-timeout', '20', '--retries', '3', '--extractor-retries', '2',
+        '--retry-sleep','http:exp=1:8','--retry-sleep','extractor:exp=1:8',
+        '--no-js-runtimes','--js-runtimes', 'node:'+process.execPath,
+        '--extractor-args','youtube:player_client=default',
+        ...(process.env.YTDLP_USER_AGENT&&process.env.YTDLP_USER_AGENT.length<=512&&!/[\r\n]/.test(process.env.YTDLP_USER_AGENT)?['--add-headers','User-Agent:'+process.env.YTDLP_USER_AGENT]:[]),
         ...(process.env.YTDLP_USE_SYSTEM_CA === '1' ? ['--compat-options','no-certifi'] : []), ...extra,
-      ], {timeout:35000, killSignal:'SIGKILL', maxBuffer:8*1024*1024, shell:false, windowsHide:true});
-      return JSON.parse(stdout);
+      ], {timeout:this.timeoutMs, maxBuffer:8*1024*1024, shell:false, windowsHide:true});
+      try{return JSON.parse(stdout);}catch{throw new AudioError('INVALID_EXTRACTOR_RESPONSE','The extractor returned invalid metadata.',502);}
     } catch (error) {
-      if (error.status) throw error;
-      // Do not expose extraction logs, cookies, or signed CDN URLs to visitors.
-      const detail=String(error.stderr||'');
-      const reason=error.killed?'timeout':/confirm you.re not a bot|Sign in to confirm|LOGIN_REQUIRED/i.test(detail)?'provider_verification':/Requested format is not available|No video formats found/i.test(detail)?'audio_format_unavailable':/not available|unavailable|Private video|removed/i.test(detail)?'recording_unavailable':'extractor_error';
-      console.warn('NOCTRA_EXTRACTOR '+JSON.stringify({reason,exitCode:typeof error.code==='number'?error.code:null}));
-      throw Object.assign(new Error('Audio extraction failed. This recording or the provider may be unavailable.'), {status:502});
+      const failure=extractionError(error,this.timeoutMs);
+      console.warn('NOCTRA_EXTRACTOR '+JSON.stringify({code:failure.code,exitCode:error.exitCode??null,diagnostic:diagnosticLine(error.stderr)}));
+      throw failure;
     } finally {this.active--;}
   }
   async search(query) {
