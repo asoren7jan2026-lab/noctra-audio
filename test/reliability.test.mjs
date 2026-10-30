@@ -50,16 +50,17 @@ async function serve(options,fn){
  try{await fn('http://127.0.0.1:'+server.address().port);}
  finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
 }
-test('public diagnostic verifies a complete 206 body and seeking once; refreshes reuse its result',async()=>{
- const size=262144;let resolves=0,done;const completion=new Promise(resolve=>{done=resolve});
+test('public diagnostic verifies bounded CDN ranges, complete audio and seeking once',async()=>{
+ const size=786509,ranges=[];let resolves=0,done;const completion=new Promise(resolve=>{done=resolve});
  await serve({
   extractor:{resolve:async(_,options)=>{if(!options?.formatId)resolves++;return normalizeAudio({...info,url:info.url+'&clen='+size},id);}},
-  fetchImpl:async(_,options)=>{const range=options.headers.Range;return new Response(new Uint8Array(range?1024:size),{status:206,headers:{'Content-Type':'audio/mp4','Content-Length':String(range?1024:size),'Content-Range':range?'bytes 1024-2047/'+size:'bytes 0-'+(size-1)+'/'+size,'Accept-Ranges':'bytes'}});},
+  fetchImpl:async(_,options)=>{const match=options.headers.Range.match(/^bytes=(\d+)-(\d+)$/);assert.ok(match);const start=Number(match[1]),end=Number(match[2]),length=end-start+1;ranges.push([start,end]);assert.ok(length<=262144);return new Response(new Uint8Array(length),{status:206,headers:{'Content-Type':'audio/mp4','Content-Length':String(length),'Content-Range':'bytes '+start+'-'+end+'/'+size,'Accept-Ranges':'bytes'}});},
   runProbe:async options=>{try{return await probeAudioGateway(options);}finally{done();}}
  },async root=>{
   let r=await fetch(root+'/test');assert.equal(r.status,202);
   await completion;
   r=await fetch(root+'/test');const result=await r.json();assert.equal(r.status,200);assert.equal(result.ok,true);assert.equal(result.bytes,size);assert.equal(result.checks.audioTransfer,'passed');assert.equal(result.checks.seeking,'passed');assert.ok(result.metadata.audioUrl.startsWith('https://audio.example.test/audio/'));
+  assert.deepEqual(ranges,[[0,262143],[262144,524287],[524288,786431],[786432,786508],[1024,2047]]);
   await fetch(root+'/test');assert.equal(resolves,1);
   r=await fetch(root+'/test?videoId=another');assert.equal(r.status,400);assert.equal(resolves,1);
   r=await fetch(root+'/internal/test',{method:'POST',body:'{}'});assert.equal(r.status,401);

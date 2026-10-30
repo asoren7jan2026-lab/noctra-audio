@@ -6,6 +6,7 @@ import {pathToFileURL} from 'node:url';
 import {Extractor, mediaURL, validId, validFormat} from './extractor.mjs';
 import {probeAudioGateway} from './probe.mjs';
 import {AudioError,publicError} from './errors.mjs';
+import {relayAudioChunks} from './relay.mjs';
 
 const fail = (message, status = 400) => Object.assign(new Error(message), {status});
 const hash = value => createHash('sha256').update(String(value)).digest();
@@ -60,7 +61,7 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
         if(!healthState.audioCheck)startTest(testRecordingId);
         const result=healthState.audioCheck,pending=result.status==='running'||result.status==='pending';
         if(pending)res.setHeader('Retry-After','3');
-        return send(res,pending?202:result.ok?200:502,{service:'online',release:process.env.RENDER_GIT_COMMIT||null,configuration:{ytDlpVersion:process.env.YTDLP_VERSION||null,nodeVersion:process.version,audioOnly:true,preferredFormat:'AAC/M4A',extractionTimeoutMs:extractor.timeoutMs||null,maxConcurrentExtractions:extractor.concurrency||null},...result});
+        return send(res,pending?202:result.ok?200:502,{service:'online',release:process.env.RENDER_GIT_COMMIT||null,configuration:{ytDlpVersion:process.env.YTDLP_VERSION||null,nodeVersion:process.version,audioOnly:true,preferredFormat:'AAC/M4A',relayChunkBytes:262144,extractionTimeoutMs:extractor.timeoutMs||null,maxConcurrentExtractions:extractor.concurrency||null},...result});
       }
       if (url.pathname.startsWith('/internal/')) {
         stage='authentication';
@@ -113,6 +114,7 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
           // The selected format is pinned in the ticket. Refreshes must not change
           // the byte representation beneath an existing seek request.
           let record = await extractor.resolve(ticket.id,{formatId:ticket.formatId});
+          if(await relayAudioChunks({record,range,method:req.method,res,extractor,ticket,fetchImpl,signal:abort.signal}))return;
           let upstream;
           for (let attempt = 0; attempt < 2; attempt++) {
             let target = record.sourceUrl;

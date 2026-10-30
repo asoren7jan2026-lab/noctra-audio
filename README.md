@@ -90,16 +90,19 @@ wake before sending the extraction request and preserves these error messages.
 - POST /internal/search: authenticated query search; falls back to general YouTube
   search. NOCTRA normally uses its existing YouTube Music catalog.
 - POST /internal/resolve: authenticated videoId (or first-result query), metadata
-  and a short-lived signed audio URL. Resolver concurrency is capped at two.
+  and a short-lived signed audio URL. Resolver concurrency is capped at one.
 - GET/HEAD /audio/:ticket: audio-only byte relay, pinned format ID, byte ranges,
-  one pre-stream refresh after 403/410, disconnect cancellation, origin checks.
+  one shared refresh after 403/410, disconnect cancellation, origin checks.
+  Sources with a signed content length use ordered 256 KiB upstream byte ranges,
+  with bounded prefetch and a 45-second deadline per part. The client still gets
+  one normal audio response; seeking requests retain their exact byte range.
 
 The service accepts only validated recording IDs and audio-only formats; it does
 not expose arbitrary URL extraction or an open proxy. It prefers direct AAC/M4A
 and never falls back to a format containing video. Incomplete upstream media is
 rejected when its byte length contradicts the signed source's content length.
 
-Tests: `node --test test/audio.test.mjs`. These use fixture extractor results and
+Tests: `node --test`. These use fixture extractor results and
 an upstream transport and do not assert that YouTube accepts a new host's IP.
 
 Five test groups cover format/host validation, extraction de-duplication, signed
