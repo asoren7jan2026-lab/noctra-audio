@@ -142,3 +142,25 @@ tickets, auth, expiry, seeking, upstream refresh, CORS and truncated audio.
 Five additional groups cover error classification, capacity recovery, real
 subprocess termination, complete 206 audio delivery, cached diagnostics and
 propagation of provider verification errors.
+
+## Browser-resolved YouTube audio
+
+The current NOCTRA frontend resolves audio with YouTube.js in the browser. This
+service supplies authenticated `/internal/youtube-proxy` and
+`/internal/browser-audio` routes, and serves short-lived `/browser-audio/:ticket`
+audio bytes with Range support. The Site holds the API key. Browser cookies,
+Google sessions and incoming authorization headers are never forwarded to YouTube.
+The legacy yt-dlp routes remain for compatibility, but are not used by the new
+frontend path. `YTDLP_COOKIES` does not authenticate the browser proxy.
+
+The proxy allows only HTTPS YouTube bootstrap/script/selected InnerTube endpoints,
+limits response/request sizes and concurrency, refuses redirects, and pauses on
+429/LOGIN_REQUIRED. Registered sources must be audio-only googlevideo URLs; the
+relay verifies upstream audio Content-Type and byte ranges. It is not an open URL
+proxy, and no iframe or video player is created.
+
+`GET /test/browser-proxy` runs a fixed anonymous session/player access check. It is
+cached for 10 minutes and never claims to verify actual browser audio delivery.
+An OK player response with zero directAudioFormats can still be unusable (for
+example SABR-only or token-restricted responses). Moving resolution to the browser
+does not change the IP YouTube sees when all requests still pass through Render.

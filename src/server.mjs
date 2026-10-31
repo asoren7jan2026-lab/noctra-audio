@@ -7,6 +7,7 @@ import {Extractor, mediaURL, validId, validFormat} from './extractor.mjs';
 import {probeAudioGateway} from './probe.mjs';
 import {AudioError,publicError} from './errors.mjs';
 import {relayAudioChunks} from './relay.mjs';
+import {BrowserYoutubeProxy} from './browser-proxy.mjs';
 
 const fail = (message, status = 400) => Object.assign(new Error(message), {status});
 const hash = value => createHash('sha256').update(String(value)).digest();
@@ -23,8 +24,8 @@ export function verifyTicket(ticket, secret, now = Date.now()) {
   if (!validId(data.id) || !validFormat(data.formatId) || !Number.isFinite(data.exp) || data.exp <= now) throw fail('Audio ticket expired. Resolve the recording again.', 401);
   return data;
 }
-async function body(req) {
-  let data = ''; for await (const chunk of req) {data += chunk; if (Buffer.byteLength(data) > 4096) throw fail('Request is too large.',413);}
+async function body(req,maxBytes=4096) {
+  let data = ''; for await (const chunk of req) {data += chunk; if (Buffer.byteLength(data) > maxBytes) throw fail('Request is too large.',413);}
   try {const parsed=JSON.parse(data);if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))throw new Error();return parsed;} catch {throw fail('Expected a JSON object.');}
 }
 function send(res, status, data) {
@@ -34,6 +35,8 @@ function send(res, status, data) {
 export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOrigin, healthState={audioCheck:null}, testRecordingId=process.env.NOCTRA_PROBE_ID||'JGwKGuC9mdc', runProbe=probeAudioGateway, extractor = new Extractor(), fetchImpl = fetch} = {}) {
   if (!apiKey || apiKey.length < 32 || !signingKey || signingKey.length < 32 || apiKey === signingKey) throw new Error('Set distinct API and signing secrets of at least 32 characters.');
   const base = new URL(publicBaseURL); if (!['http:','https:'].includes(base.protocol)) throw new Error('Invalid public audio service URL.');
+  const browserProxy=new BrowserYoutubeProxy({fetchImpl,signingKey,publicBaseURL,allowedOrigin});
+  const browserDiagnostic=new BrowserYoutubeProxy({fetchImpl,signingKey,publicBaseURL,allowedOrigin});
   const rates = new Map(); let activeStreams = 0,diagnosticJob=null;
   const startTest=id=>{
     if(!validId(id))throw new AudioError('INVALID_RECORDING_ID','A canonical 11-character recording ID is required.',400,false,'diagnostic');
@@ -55,7 +58,12 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
     let stage='request';
     try {
       const url = new URL(req.url, 'http://audio.internal');
-      if (url.pathname === '/health' && req.method === 'GET') return send(res,200,{ok:true,provider:extractor.availability?.()||{available:true},authentication:extractor.authentication?.()||{configured:false,publicRecordingsOnly:true},...(healthState?{audioCheck:healthState.audioCheck}:{} )});
+      if (url.pathname === '/health' && req.method === 'GET') return send(res,200,{ok:true,browserProxy:{enabled:true,authenticated:false,...browserProxy.availability()},provider:extractor.availability?.()||{available:true},authentication:extractor.authentication?.()||{configured:false,publicRecordingsOnly:true},...(healthState?{audioCheck:healthState.audioCheck}:{} )});
+      if(url.pathname.startsWith('/browser-audio/')&&['GET','HEAD','OPTIONS'].includes(req.method)){await browserProxy.stream(req,res,url.pathname.slice('/browser-audio/'.length));return;}
+      if(url.pathname==='/test/browser-proxy'&&req.method==='GET'){
+        if(url.search)throw fail('This diagnostic uses a fixed recording.',400);
+        const result=await browserDiagnostic.diagnose();return send(res,result.ok?200:502,result);
+      }
       if(url.pathname==='/test'&&req.method==='GET'){
         if(url.search)throw fail('The public diagnostic uses a fixed test recording. Use the authenticated internal test endpoint to choose another.',400);
         if(!healthState.audioCheck)startTest(testRecordingId);
@@ -68,6 +76,10 @@ export function createAudioServer({apiKey, signingKey, publicBaseURL, allowedOri
         if (!equal(req.headers.authorization || '', 'Bearer ' + apiKey)) throw fail('Unauthorized.',401);
         // This identity is supplied only by NOCTRA's authenticated server.
         limit('resolve:' + (req.headers['x-noctra-user'] || req.socket.remoteAddress || 'unknown'));
+        if(url.pathname==='/internal/youtube-proxy'&&req.method==='POST'){
+          const result=await browserProxy.request(await body(req,262144));res.writeHead(result.status,result.headers);res.end(result.data);return;
+        }
+        if(url.pathname==='/internal/browser-audio'&&req.method==='POST')return send(res,200,browserProxy.register(await body(req,16000)));
         if(url.pathname==='/internal/test'&&req.method==='POST'){
           const input=await body(req);
           if(diagnosticJob)throw new AudioError('DIAGNOSTIC_BUSY','An audio diagnostic is already running. Read /test for its progress.',503,true,'diagnostic');
